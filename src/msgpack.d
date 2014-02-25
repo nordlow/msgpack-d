@@ -88,6 +88,954 @@ version(unittest) import std.file, std.c.string;
 @trusted:
 
 
+public:
+
+
+// Convenient functions
+
+
+/**
+ * Serializes $(D_PARAM args).
+ *
+ * Assumes single object if the length of $(D_PARAM args) == 1,
+ * otherwise array object.
+ *
+ * Params:
+ *  args = the contents to serialize.
+ *
+ * Returns:
+ *  a serialized data.
+ */
+ubyte[] pack(bool withFieldName = false, Args...)(in Args args)
+{
+    auto packer = Packer(withFieldName);
+
+    static if (Args.length == 1)
+        packer.pack(args[0]);
+    else
+        packer.packArray(args);
+
+    return packer.stream.data;
+}
+
+
+unittest
+{
+    auto serialized = pack(false);
+
+    assert(serialized[0] == Format.FALSE);
+
+    auto deserialized = unpack(pack(1, true, "Foo"));
+
+    assert(deserialized.type == Value.Type.array);
+    assert(deserialized.via.array[0].type == Value.Type.unsigned);
+    assert(deserialized.via.array[1].type == Value.Type.boolean);
+    assert(deserialized.via.array[2].type == Value.Type.raw);
+}
+
+
+/**
+ * Deserializes $(D_PARAM buffer) using stream deserializer.
+ *
+ * Params:
+ *  buffer = the buffer to deserialize.
+ *
+ * Returns:
+ *  a $(D Unpacked) contains deserialized object.
+ *
+ * Throws:
+ *  UnpackException if deserialization doesn't succeed.
+ */
+Unpacked unpack(in ubyte[] buffer)
+{
+    auto unpacker = StreamingUnpacker(buffer);
+
+    if (!unpacker.execute())
+        throw new UnpackException("Deserialization failure");
+
+    return unpacker.unpacked;
+}
+
+
+/**
+ * Deserializes $(D_PARAM buffer) using direct-conversion deserializer.
+ *
+ * Assumes single object if the length of $(D_PARAM args) == 1,
+ * otherwise array object.
+ *
+ * Params:
+ *  buffer = the buffer to deserialize.
+ *  args   = the references of values to assign.
+ */
+void unpack(bool withFieldName = false, Args...)(in ubyte[] buffer, ref Args args)
+{
+    auto unpacker = Unpacker(buffer, buffer.length, withFieldName);
+
+    static if (Args.length == 1)
+        unpacker.unpack(args[0]);
+    else
+        unpacker.unpackArray(args);
+}
+
+
+/**
+ * Return value version
+ */
+Type unpack(Type, bool withFieldName = false)(in ubyte[] buffer)
+{
+    auto unpacker = Unpacker(buffer, buffer.length, withFieldName);
+
+    Type result;
+    unpacker.unpack(result);
+    return result;
+}
+
+
+unittest
+{
+    { // stream
+        auto result = unpack(pack(false));
+
+        assert(result.via.boolean == false);
+    }
+    { // direct conversion
+        Tuple!(uint, string) result;
+        Tuple!(uint, string) test = tuple(1, "Hi!");
+
+        unpack(pack(test), result);
+        assert(result == test);
+
+        test.field[0] = 2;
+        test.field[1] = "Hey!";
+        unpack(pack(test.field[0], test.field[1]), result.field[0], result.field[1]);
+        assert(result == test);
+    }
+    { // return value direct conversion
+        Tuple!(uint, string) test = tuple(1, "Hi!");
+
+        auto data = pack(test);
+        assert(data.unpack!(Tuple!(uint, string)) == test);
+    }
+    { // serialize object as a Map
+        static class C
+        {
+            int num;
+
+            this(int num) { this.num = num; }
+        }
+
+        auto test = new C(10);
+        auto result = new C(100);
+
+        unpack!(true)(pack!(true)(test), result);
+        assert(result.num == 10, "Unpacking with field names failed");
+    }
+}
+
+
+unittest
+{
+    // unittest for https://github.com/msgpack/msgpack-d/issues/8
+    foreach (Type; TypeTuple!(byte, short, int, long)) {
+        foreach (i; [-33, -20, -1, 0, 1, 20, 33]) {
+            Type a = cast(Type)i;
+            Type b;
+            unpack(pack(a), b);
+            assert(a == b);
+        }
+    }
+}
+
+
+/**
+ * $(D MessagePackException) is a root Exception for MessagePack related operation.
+ */
+class MessagePackException : Exception
+{
+    pure this(string message)
+    {
+        super(message);
+    }
+}
+
+
+/**
+ * Attribute for specifying non pack/unpack field.
+ * This is an alternative approach of MessagePackable mixin.
+ *
+ * Example:
+ * -----
+ * struct S
+ * {
+ *     int num;
+ *     // Packer/Unpacker ignores this field;
+ *     @nonPacked string str;
+ * }
+ * -----
+ */
+struct nonPacked {}
+
+template isPackedField(alias field)
+{
+    enum isPackedField = (staticIndexOf!(nonPacked, __traits(getAttributes, field)) == -1) && (!isSomeFunction!(typeof(field)));
+}
+
+
+// Serializing routines
+
+
+/**
+ * $(D Packer) is a $(D MessagePack) serializer
+ *
+ * Example:
+ * -----
+ * auto packer = packer(Appender!(ubyte[])());
+ *
+ * packer.packArray(false, 100, 1e-10, null);
+ *
+ * stdout.rawWrite(packer.buffer.data);
+ * -----
+ *
+ * NOTE:
+ *  Current implementation can't deal with a circular reference.
+ *  If you try to serialize a object that has circular reference, runtime raises 'Stack Overflow'.
+ */
+struct PackerImpl(Stream) if (isOutputRange!(Stream, ubyte) && isOutputRange!(Stream, ubyte[]))
+{
+  private:
+    static @system
+    {
+        alias void delegate(ref PackerImpl, void*) PackHandler;
+        PackHandler[TypeInfo] packHandlers;
+
+        public void registerHandler(T, alias Handler)()
+        {
+            packHandlers[typeid(T)] = delegate(ref PackerImpl packer, void* obj) {
+                Handler(packer, *cast(T*)obj);
+            };
+        }
+    }
+
+    enum size_t Offset = 1;  // type-information offset
+
+    Stream                   stream_;  // the stream to write
+    ubyte[Offset + RealSize] store_;   // stores serialized value
+    bool                     withFieldName_;
+
+
+  public:
+    /**
+     * Constructs a packer with $(D_PARAM stream).
+     *
+     * Params:
+     *  stream        = the stream to write.
+     *  withFieldName = serialize class / struct with field name
+     */
+    this(Stream stream, bool withFieldName = false)
+    {
+        stream_        = stream;
+        withFieldName_ = withFieldName;
+    }
+
+
+    /**
+     * Constructs a packer with $(D_PARAM withFieldName).
+     *
+     * Params:
+     *  withFieldName = serialize class / struct with field name
+     */
+    this(bool withFieldName = false)
+    {
+        withFieldName_ = withFieldName;
+    }
+
+
+    /**
+     * Forwards to stream.
+     *
+     * Returns:
+     *  the stream.
+     */
+    @property @safe
+    nothrow ref Stream stream()
+    {
+        return stream_;
+    }
+
+
+    /**
+     * Serializes argument and writes to stream.
+     *
+     * If the argument is the pointer type, dereferences the pointer and serializes pointed value.
+     * -----
+     * int  a = 10;
+     * int* b = &b;
+     *
+     * packer.pack(b);  // serializes 10, not address of a
+     * -----
+     * Serializes nil if the argument of nullable type is null.
+     *
+     * NOTE:
+     *  MessagePack doesn't define $(D_KEYWORD real) type format.
+     *  Don't serialize $(D_KEYWORD real) if you communicate with other languages.
+     *  Transfer $(D_KEYWORD double) serialization if $(D_KEYWORD real) on your environment equals $(D_KEYWORD double).
+     *
+     * Params:
+     *  value = the content to serialize.
+     *
+     * Returns:
+     *  self, i.e. for method chaining.
+     */
+    ref PackerImpl pack(T)(in T value) if (is(Unqual!T == bool))
+    {
+        if (value)
+            stream_.put(Format.TRUE);
+        else
+            stream_.put(Format.FALSE);
+
+        return this;
+    }
+
+
+    /// ditto
+    ref PackerImpl pack(T)(in T value) if (isUnsigned!T && !is(Unqual!T == enum))
+    {
+        // ulong < ulong is slower than uint < uint
+        static if (!is(Unqual!T  == ulong)) {
+            enum Bits = T.sizeof * 8;
+
+            if (value < (1 << 8)) {
+                if (value < (1 << 7)) {
+                    // fixnum
+                    stream_.put(take8from!Bits(value));
+                } else {
+                    // uint 8
+                    store_[0] = Format.UINT8;
+                    store_[1] = take8from!Bits(value);
+                    stream_.put(store_[0..Offset + ubyte.sizeof]);
+                }
+            } else {
+                if (value < (1 << 16)) {
+                    // uint 16
+                    const temp = convertEndianTo!16(value);
+
+                    store_[0] = Format.UINT16;
+                    *cast(ushort*)&store_[Offset] = temp;
+                    stream_.put(store_[0..Offset + ushort.sizeof]);
+                } else {
+                    // uint 32
+                    const temp = convertEndianTo!32(value);
+
+                    store_[0] = Format.UINT32;
+                    *cast(uint*)&store_[Offset] = temp;
+                    stream_.put(store_[0..Offset + uint.sizeof]);
+                }
+            }
+        } else {
+            if (value < (1UL << 8)) {
+                if (value < (1UL << 7)) {
+                    // fixnum
+                    stream_.put(take8from!64(value));
+                } else {
+                    // uint 8
+                    store_[0] = Format.UINT8;
+                    store_[1] = take8from!64(value);
+                    stream_.put(store_[0..Offset + ubyte.sizeof]);
+                }
+            } else {
+                if (value < (1UL << 16)) {
+                    // uint 16
+                    const temp = convertEndianTo!16(value);
+
+                    store_[0] = Format.UINT16;
+                    *cast(ushort*)&store_[Offset] = temp;
+                    stream_.put(store_[0..Offset + ushort.sizeof]);
+                } else if (value < (1UL << 32)){
+                    // uint 32
+                    const temp = convertEndianTo!32(value);
+
+                    store_[0] = Format.UINT32;
+                    *cast(uint*)&store_[Offset] = temp;
+                    stream_.put(store_[0..Offset + uint.sizeof]);
+                } else {
+                    // uint 64
+                    const temp = convertEndianTo!64(value);
+
+                    store_[0] = Format.UINT64;
+                    *cast(ulong*)&store_[Offset] = temp;
+                    stream_.put(store_[0..Offset + ulong.sizeof]);
+                }
+            }
+        }
+
+        return this;
+    }
+
+
+    /// ditto
+    ref PackerImpl pack(T)(in T value) if (isSigned!T && isIntegral!T && !is(Unqual!T == enum))
+    {
+        // long < long is slower than int < int
+        static if (!is(Unqual!T == long)) {
+            enum Bits = T.sizeof * 8;
+
+            if (value < -(1 << 5)) {
+                if (value < -(1 << 15)) {
+                    // int 32
+                    const temp = convertEndianTo!32(value);
+
+                    store_[0] = Format.INT32;
+                    *cast(int*)&store_[Offset] = temp;
+                    stream_.put(store_[0..Offset + int.sizeof]);
+                } else if (value < -(1 << 7)) {
+                    // int 16
+                    const temp = convertEndianTo!16(value);
+
+                    store_[0] = Format.INT16;
+                    *cast(short*)&store_[Offset] = temp;
+                    stream_.put(store_[0..Offset + short.sizeof]);
+                } else {
+                    // int 8
+                    store_[0] = Format.INT8;
+                    store_[1] = take8from!Bits(value);
+                    stream_.put(store_[0..Offset + byte.sizeof]);
+                }
+            } else if (value < (1 << 7)) {
+                // fixnum
+                stream_.put(take8from!Bits(value));
+            } else {
+                if (value < (1 << 8)) {
+                    // uint 8
+                    store_[0] = Format.UINT8;
+                    store_[1] = take8from!Bits(value);
+                    stream_.put(store_[0..Offset + ubyte.sizeof]);
+                } else if (value < (1 << 16)) {
+                    // uint 16
+                    const temp = convertEndianTo!16(value);
+
+                    store_[0] = Format.UINT16;
+                    *cast(ushort*)&store_[Offset] = temp;
+                    stream_.put(store_[0..Offset + ushort.sizeof]);
+                } else {
+                    // uint 32
+                    const temp = convertEndianTo!32(value);
+
+                    store_[0] = Format.UINT32;
+                    *cast(uint*)&store_[Offset] = temp;
+                    stream_.put(store_[0..Offset + uint.sizeof]);
+                }
+            }
+        } else {
+            if (value < -(1L << 5)) {
+                if (value < -(1L << 15)) {
+                    if (value < -(1L << 31)) {
+                        // int 64
+                        const temp = convertEndianTo!64(value);
+
+                        store_[0] = Format.INT64;
+                        *cast(long*)&store_[Offset] = temp;
+                        stream_.put(store_[0..Offset + long.sizeof]);
+                    } else {
+                        // int 32
+                        const temp = convertEndianTo!32(value);
+
+                        store_[0] = Format.INT32;
+                        *cast(int*)&store_[Offset] = temp;
+                        stream_.put(store_[0..Offset + int.sizeof]);
+                    }
+                } else {
+                    if (value < -(1L << 7)) {
+                        // int 16
+                        const temp = convertEndianTo!16(value);
+
+                        store_[0] = Format.INT16;
+                        *cast(short*)&store_[Offset] = temp;
+                        stream_.put(store_[0..Offset + short.sizeof]);
+                    } else {
+                        // int 8
+                        store_[0] = Format.INT8;
+                        store_[1] = take8from!64(value);
+                        stream_.put(store_[0..Offset + byte.sizeof]);
+                    }
+                }
+            } else if (value < (1L << 7)) {
+                // fixnum
+                stream_.put(take8from!64(value));
+            } else {
+                if (value < (1L << 16)) {
+                    if (value < (1L << 8)) {
+                        // uint 8
+                        store_[0] = Format.UINT8;
+                        store_[1] = take8from!64(value);
+                        stream_.put(store_[0..Offset + ubyte.sizeof]);
+                    } else {
+                        // uint 16
+                        const temp = convertEndianTo!16(value);
+
+                        store_[0] = Format.UINT16;
+                        *cast(ushort*)&store_[Offset] = temp;
+                        stream_.put(store_[0..Offset + ushort.sizeof]);
+                    }
+                } else {
+                    if (value < (1L << 32)) {
+                        // uint 32
+                        const temp = convertEndianTo!32(value);
+
+                        store_[0] = Format.UINT32;
+                        *cast(uint*)&store_[Offset] = temp;
+                        stream_.put(store_[0..Offset + uint.sizeof]);
+                    } else {
+                        // uint 64
+                        const temp = convertEndianTo!64(value);
+
+                        store_[0] = Format.UINT64;
+                        *cast(ulong*)&store_[Offset] = temp;
+                        stream_.put(store_[0..Offset + ulong.sizeof]);
+                    }
+                }
+            }
+        }
+
+        return this;
+    }
+
+
+    /// ditto
+    ref PackerImpl pack(T)(in T value) if (isFloatingPoint!T && !is(Unqual!T == enum))
+    {
+        static if (is(Unqual!T == float)) {
+            const temp = convertEndianTo!32(_f(value).i);
+
+            store_[0] = Format.FLOAT;
+            *cast(uint*)&store_[Offset] = temp;
+            stream_.put(store_[0..Offset + uint.sizeof]);
+        } else static if (is(Unqual!T == double)) {
+            const temp = convertEndianTo!64(_d(value).i);
+
+            store_[0] = Format.DOUBLE;
+            *cast(ulong*)&store_[Offset] = temp;
+            stream_.put(store_[0..Offset + ulong.sizeof]);
+        } else {
+            static if ((real.sizeof > double.sizeof) && EnableReal) {
+                store_[0]      = Format.REAL;
+                const temp     = _r(value);
+                const fraction = convertEndianTo!64(temp.fraction);
+                const exponent = convertEndianTo!16(temp.exponent);
+
+                *cast(Unqual!(typeof(fraction))*)&store_[Offset]                   = fraction;
+                *cast(Unqual!(typeof(exponent))*)&store_[Offset + fraction.sizeof] = exponent;
+                stream_.put(store_[0..$]);
+            } else {  // Non-x86 CPUs, real type equals double type.
+                pack(cast(double)value);
+            }
+        }
+
+        return this;
+    }
+
+
+    /// ditto
+    ref PackerImpl pack(T)(in T value) if (is(Unqual!T == enum))
+    {
+        pack(cast(OriginalType!T)value);
+
+        return this;
+    }
+
+
+    /// Overload for pack(null) for 2.057 or later
+    static if (!is(typeof(null) == void*))
+    {
+        ref PackerImpl pack(T)(in T value) if (is(Unqual!T == typeof(null)))
+        {
+            return packNil();
+        }
+    }
+
+
+    /// ditto
+    ref PackerImpl pack(T)(in T value) if (isPointer!T)
+    {
+        static if (is(Unqual!T == void*)) {  // for pack(null) for 2.056 or earlier
+            enforce(value is null, "Can't serialize void type");
+            stream_.put(Format.NIL);
+        } else {
+            if (value is null)
+                stream_.put(Format.NIL);
+            else
+                pack(mixin(AsteriskOf!T ~ "value"));
+        }
+
+        return this;
+    }
+
+
+    /// ditto
+    ref PackerImpl pack(T)(in T array) if (isArray!T)
+    {
+        alias typeof(T.init[0]) U;
+
+        /*
+         * Serializes raw type-information to stream.
+         */
+        void beginRaw(in size_t length)
+        {
+            if (length < 32) {
+                const ubyte temp = Format.RAW | cast(ubyte)length;
+                stream_.put(take8from(temp));
+            } else if (length < 65536) {
+                const temp = convertEndianTo!16(length);
+
+                store_[0] = Format.RAW16;
+                *cast(ushort*)&store_[Offset] = temp;
+                stream_.put(store_[0..Offset + ushort.sizeof]);
+            } else {
+                const temp = convertEndianTo!32(length);
+
+                store_[0] = Format.RAW32;
+                *cast(uint*)&store_[Offset] = temp;
+                stream_.put(store_[0..Offset + uint.sizeof]);
+            }
+        }
+
+        if (array.empty)
+            return packNil();
+
+        // Raw bytes
+        static if (isByte!(U) || isSomeChar!(U)) {
+            ubyte[] raw = cast(ubyte[])array;
+
+            beginRaw(raw.length);
+            stream_.put(raw);
+        } else {
+            beginArray(array.length);
+            foreach (elem; array)
+                pack(elem);
+        }
+
+        return this;
+    }
+
+
+    /// ditto
+    ref PackerImpl pack(T)(in T array) if (isAssociativeArray!T)
+    {
+        if (array is null)
+            return packNil();
+
+        beginMap(array.length);
+        foreach (key, value; array) {
+            pack(key);
+            pack(value);
+        }
+
+        return this;
+    }
+
+
+    /// ditto
+    ref PackerImpl pack(Types...)(auto ref const Types objects) if (Types.length > 1)
+    {
+        foreach (i, T; Types)
+            pack(objects[i]);
+
+        return this;
+    }
+
+
+    /**
+     * Serializes $(D_PARAM object) and writes to stream.
+     *
+     * Calling $(D toMsgpack) if $(D_KEYWORD class) and $(D_KEYWORD struct) implement $(D toMsgpack) method. $(D toMsgpack) signature is:
+     * -----
+     * void toMsgpack(Packer)(ref Packer packer) const
+     * -----
+     * This method serializes all members of T object if $(D_KEYWORD class) and $(D_KEYWORD struct) don't implement $(D toMsgpack).
+     *
+     * An object that doesn't implement $(D toMsgpack) is serialized to Array type.
+     * -----
+     * packer.pack(tuple(true, 1, "Hi!"))  // -> '[true, 1, "Hi!"]', not 'ture, 1, "Hi!"'
+     *
+     * struct Foo
+     * {
+     *     int num    = 10;
+     *     string msg = "D!";
+     * }
+     * packer.pack(Foo());  // -> '[10, "D!"]'
+     *
+     * class Base
+     * {
+     *     bool flag = true;
+     * }
+     * class Derived : Base
+     * {
+     *     double = 0.5f;
+     * }
+     * packer.pack(new Derived());  // -> '[true, 0.5f]'
+     * -----
+     *
+     * Params:
+     *  object = the content to serialize.
+     *
+     * Returns:
+     *  self, i.e. for method chaining.
+     */
+    ref PackerImpl pack(T)(in T object) if (is(Unqual!T == class))
+    {
+        if (object is null)
+            return packNil();
+
+        static if (hasMember!(T, "toMsgpack"))
+        {
+            static if (__traits(compiles, { T t; t.toMsgpack(this, withFieldName_); })) {
+                object.toMsgpack(this, withFieldName_);
+            /* } else static if (__traits(compiles, { T t; t.toMsgpack(this); })) { // backward compatible */
+            /*     object.toMsgpack(this); */
+            } else {
+                object.toMsgpack(this);
+                /* static assert(0, "Failed to invoke 'toMsgpack' on type '" ~ T.stringof ~ "'"); */
+            }
+        } else {
+            if (auto handler = object.classinfo in packHandlers) {
+                (*handler)(this, cast(void*)&object);
+                return this;
+            }
+            if (T.classinfo !is object.classinfo) {
+                throw new MessagePackException("Can't pack derived class through reference to base class.");
+            }
+
+            alias SerializingClasses!(T) Classes;
+
+            immutable memberNum = SerializingMemberNumbers!(Classes);
+            if (withFieldName_)
+                beginMap(memberNum);
+            else
+                beginArray(memberNum);
+
+            foreach (Class; Classes) {
+                Class obj = cast(Class)object;
+                if (withFieldName_) {
+                    foreach (i, f ; obj.tupleof) {
+                        static if (isPackedField!(Class.tupleof[i])) {
+                            pack(getFieldName!(Class, i));
+                            pack(f);
+                        }
+                    }
+                } else {
+                    foreach (i, f ; obj.tupleof) {
+                        static if (isPackedField!(Class.tupleof[i]))
+                            pack(f);
+                    }
+                }
+            }
+        }
+
+        return this;
+    }
+
+
+    /// ditto
+    @trusted
+    ref PackerImpl pack(T)(auto ref T object) if (is(Unqual!T == struct))
+    {
+        static if (hasMember!(T, "toMsgpack"))
+        {
+            static if (__traits(compiles, { T t; t.toMsgpack(this, withFieldName_); })) {
+                object.toMsgpack(this, withFieldName_);
+            /* } else static if (__traits(compiles, { T t; t.toMsgpack(this); })) { // backward compatible */
+            /*     object.toMsgpack(this); */
+            } else {
+                object.toMsgpack(this);
+                /* static assert(0, "Failed to invoke 'toMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
+            }
+        } else static if (isTuple!T) {
+            beginArray(object.field.length);
+            foreach (f; object.field)
+                pack(f);
+        } else {  // simple struct
+            if (auto handler = typeid(T) in packHandlers) {
+                (*handler)(this, cast(void*)&object);
+                return this;
+            }
+
+            immutable memberNum = SerializingMemberNumbers!(T);
+            if (withFieldName_)
+                beginMap(memberNum);
+            else
+                beginArray(memberNum);
+
+            if (withFieldName_) {
+                foreach (i, f; object.tupleof) {
+                    static if (isPackedField!(T.tupleof[i]) && __traits(compiles, { pack(f); }))
+                    {
+                        pack(getFieldName!(T, i));
+                        pack(f);
+                    }
+                }
+            } else {
+                foreach (i, f; object.tupleof) {
+                    static if (isPackedField!(T.tupleof[i]) && __traits(compiles, { pack(f); }))
+                        pack(f);
+                }
+            }
+        }
+
+        return this;
+    }
+
+
+    /**
+     * Serializes the arguments as container to stream.
+     *
+     * -----
+     * packer.packArray(true, 1);  // -> [true, 1]
+     * packer.packMap("Hi", 100);  // -> ["Hi":100]
+     * -----
+     *
+     * In packMap, the number of arguments must be even.
+     *
+     * Params:
+     *  objects = the contents to serialize.
+     *
+     * Returns:
+     *  self, i.e. for method chaining.
+     */
+    ref PackerImpl packArray(Types...)(auto ref const Types objects)
+    {
+        beginArray(Types.length);
+        foreach (i, T; Types)
+            pack(objects[i]);
+        //pack(objects);  // slow :(
+
+        return this;
+    }
+
+
+    /// ditto
+    ref PackerImpl packMap(Types...)(auto ref const Types objects)
+    {
+        static assert(Types.length % 2 == 0, "The number of arguments must be even");
+
+        beginMap(Types.length / 2);
+        foreach (i, T; Types)
+            pack(objects[i]);
+
+        return this;
+    }
+
+
+    /**
+     * Serializes the type-information to stream.
+     *
+     * These methods don't serialize contents.
+     * You need to call pack method to serialize contents at your own risk.
+     * -----
+     * packer.beginArray(3).pack(true, 1);  // -> [true, 1,
+     *
+     * // other operation
+     *
+     * packer.pack("Hi!");                  // -> [true, 1, "Hi!"]
+     * -----
+     *
+     * Params:
+     *  length = the length of container.
+     *
+     * Returns:
+     *  self, i.e. for method chaining.
+     */
+    ref PackerImpl beginArray(in size_t length)
+    {
+        if (length < 16) {
+            const ubyte temp = Format.ARRAY | cast(ubyte)length;
+            stream_.put(take8from(temp));
+        } else if (length < 65536) {
+            const temp = convertEndianTo!16(length);
+
+            store_[0] = Format.ARRAY16;
+            *cast(ushort*)&store_[Offset] = temp;
+            stream_.put(store_[0..Offset + ushort.sizeof]);
+        } else {
+            const temp = convertEndianTo!32(length);
+
+            store_[0] = Format.ARRAY32;
+            *cast(uint*)&store_[Offset] = temp;
+            stream_.put(store_[0..Offset + uint.sizeof]);
+        }
+
+        return this;
+    }
+
+
+    /// ditto
+    ref PackerImpl beginMap(in size_t length)
+    {
+        if (length < 16) {
+            const ubyte temp = Format.MAP | cast(ubyte)length;
+            stream_.put(take8from(temp));
+        } else if (length < 65536) {
+            const temp = convertEndianTo!16(length);
+
+            store_[0] = Format.MAP16;
+            *cast(ushort*)&store_[Offset] = temp;
+            stream_.put(store_[0..Offset + ushort.sizeof]);
+        } else {
+            const temp = convertEndianTo!32(length);
+
+            store_[0] = Format.MAP32;
+            *cast(uint*)&store_[Offset] = temp;
+            stream_.put(store_[0..Offset + uint.sizeof]);
+        }
+
+        return this;
+    }
+
+
+  private:
+    /*
+     * Serializes the nil value.
+     */
+    ref PackerImpl packNil()
+    {
+        stream_.put(Format.NIL);
+        return this;
+    }
+}
+
+
+/// Default serializer
+alias PackerImpl!(Appender!(ubyte[])) Packer;  // should be pure struct?
+
+
+/**
+ * Register a serialization handler for $(D_PARAM T) type
+ *
+ * Example:
+ * -----
+ * registerPackHandler!(Foo, fooPackHandler);
+ * -----
+ */
+void registerPackHandler(T, alias Handler, Stream = Appender!(ubyte[]))()
+{
+    PackerImpl!(Stream).registerHandler!(T, Handler);
+}
+
+
+/**
+ * Helper for $(D Packer) construction.
+ *
+ * Params:
+ *  stream = the stream to write.
+ *  withFieldName = serialize class / struct with field name
+ *
+ * Returns:
+ *  a $(D Packer) object instantiated and initialized according to the arguments.
+ */
+PackerImpl!(Stream) packer(Stream)(Stream stream, bool withFieldName = false)
+{
+    return typeof(return)(stream, withFieldName);
+}
+
+
 // Buffer implementations
 
 
@@ -284,753 +1232,16 @@ unittest
 }
 
 
-/**
- * $(D MessagePackException) is a root Exception for MessagePack related operation.
- */
-class MessagePackException : Exception
-{
-    pure this(string message)
-    {
-        super(message);
-    }
-}
-
-
-/**
- * Attribute for specifying non pack/unpack field.
- * This is an alternative approach of MessagePackable mixin.
- *
- * Example:
- * -----
- * struct S
- * {
- *     int num;
- *     // Packer/Unpacker ignores this field;
- *     @nonPacked string str;
- * }
- * -----
- */
-struct nonPacked {}
-
-template isPackedField(alias field)
-{
-    enum isPackedField = (staticIndexOf!(nonPacked, __traits(getAttributes, field)) == -1) && (!isSomeFunction!(typeof(field)));
-}
-
-
-// Serializing routines
-
-
-/**
- * $(D Packer) is a $(D MessagePack) serializer
- *
- * Example:
- * -----
- * auto packer = packer(Appender!(ubyte[])());
- *
- * packer.packArray(false, 100, 1e-10, null);
- *
- * stdout.rawWrite(packer.buffer.data);
- * -----
- *
- * NOTE:
- *  Current implementation can't deal with a circular reference.
- *  If you try to serialize a object that has circular reference, runtime raises 'Stack Overflow'.
- */
-struct Packer(Stream) if (isOutputRange!(Stream, ubyte) && isOutputRange!(Stream, ubyte[]))
-{
-  private:
-    enum size_t Offset = 1;  // type-information offset
-
-    Stream                   stream_;  // the stream to write
-    ubyte[Offset + RealSize] store_;   // stores serialized value
-    bool                     withFieldName_;
-
-
-  public:
-    /**
-     * Constructs a packer with $(D_PARAM stream).
-     *
-     * Params:
-     *  stream        = the stream to write.
-     *  withFieldName = serialize a field name at class or struct
-     */
-    this(Stream stream, bool withFieldName = false)
-    {
-        stream_        = stream;
-        withFieldName_ = withFieldName;
-    }
-
-
-    /**
-     * Forwards to stream.
-     *
-     * Returns:
-     *  the stream.
-     */
-    @property @safe
-    nothrow ref Stream stream()
-    {
-        return stream_;
-    }
-
-
-    /**
-     * Serializes argument and writes to stream.
-     *
-     * If the argument is the pointer type, dereferences the pointer and serializes pointed value.
-     * -----
-     * int  a = 10;
-     * int* b = &b;
-     *
-     * packer.pack(b);  // serializes 10, not address of a
-     * -----
-     * Serializes nil if the argument of nullable type is null.
-     *
-     * NOTE:
-     *  MessagePack doesn't define $(D_KEYWORD real) type format.
-     *  Don't serialize $(D_KEYWORD real) if you communicate with other languages.
-     *  Transfer $(D_KEYWORD double) serialization if $(D_KEYWORD real) on your environment equals $(D_KEYWORD double).
-     *
-     * Params:
-     *  value = the content to serialize.
-     *
-     * Returns:
-     *  self, i.e. for method chaining.
-     */
-    ref Packer pack(T)(in T value) if (is(Unqual!T == bool))
-    {
-        if (value)
-            stream_.put(Format.TRUE);
-        else
-            stream_.put(Format.FALSE);
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer pack(T)(in T value) if (isUnsigned!T && !is(Unqual!T == enum))
-    {
-        // ulong < ulong is slower than uint < uint
-        static if (!is(Unqual!T  == ulong)) {
-            enum Bits = T.sizeof * 8;
-
-            if (value < (1 << 8)) {
-                if (value < (1 << 7)) {
-                    // fixnum
-                    stream_.put(take8from!Bits(value));
-                } else {
-                    // uint 8
-                    store_[0] = Format.UINT8;
-                    store_[1] = take8from!Bits(value);
-                    stream_.put(store_[0..Offset + ubyte.sizeof]);
-                }
-            } else {
-                if (value < (1 << 16)) {
-                    // uint 16
-                    const temp = convertEndianTo!16(value);
-
-                    store_[0] = Format.UINT16;
-                    *cast(ushort*)&store_[Offset] = temp;
-                    stream_.put(store_[0..Offset + ushort.sizeof]);
-                } else {
-                    // uint 32
-                    const temp = convertEndianTo!32(value);
-
-                    store_[0] = Format.UINT32;
-                    *cast(uint*)&store_[Offset] = temp;
-                    stream_.put(store_[0..Offset + uint.sizeof]);
-                }
-            }
-        } else {
-            if (value < (1UL << 8)) {
-                if (value < (1UL << 7)) {
-                    // fixnum
-                    stream_.put(take8from!64(value));
-                } else {
-                    // uint 8
-                    store_[0] = Format.UINT8;
-                    store_[1] = take8from!64(value);
-                    stream_.put(store_[0..Offset + ubyte.sizeof]);
-                }
-            } else {
-                if (value < (1UL << 16)) {
-                    // uint 16
-                    const temp = convertEndianTo!16(value);
-
-                    store_[0] = Format.UINT16;
-                    *cast(ushort*)&store_[Offset] = temp;
-                    stream_.put(store_[0..Offset + ushort.sizeof]);
-                } else if (value < (1UL << 32)){
-                    // uint 32
-                    const temp = convertEndianTo!32(value);
-
-                    store_[0] = Format.UINT32;
-                    *cast(uint*)&store_[Offset] = temp;
-                    stream_.put(store_[0..Offset + uint.sizeof]);
-                } else {
-                    // uint 64
-                    const temp = convertEndianTo!64(value);
-
-                    store_[0] = Format.UINT64;
-                    *cast(ulong*)&store_[Offset] = temp;
-                    stream_.put(store_[0..Offset + ulong.sizeof]);
-                }
-            }
-        }
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer pack(T)(in T value) if (isSigned!T && isIntegral!T && !is(Unqual!T == enum))
-    {
-        // long < long is slower than int < int
-        static if (!is(Unqual!T == long)) {
-            enum Bits = T.sizeof * 8;
-
-            if (value < -(1 << 5)) {
-                if (value < -(1 << 15)) {
-                    // int 32
-                    const temp = convertEndianTo!32(value);
-
-                    store_[0] = Format.INT32;
-                    *cast(int*)&store_[Offset] = temp;
-                    stream_.put(store_[0..Offset + int.sizeof]);
-                } else if (value < -(1 << 7)) {
-                    // int 16
-                    const temp = convertEndianTo!16(value);
-
-                    store_[0] = Format.INT16;
-                    *cast(short*)&store_[Offset] = temp;
-                    stream_.put(store_[0..Offset + short.sizeof]);
-                } else {
-                    // int 8
-                    store_[0] = Format.INT8;
-                    store_[1] = take8from!Bits(value);
-                    stream_.put(store_[0..Offset + byte.sizeof]);
-                }
-            } else if (value < (1 << 7)) {
-                // fixnum
-                stream_.put(take8from!Bits(value));
-            } else {
-                if (value < (1 << 8)) {
-                    // uint 8
-                    store_[0] = Format.UINT8;
-                    store_[1] = take8from!Bits(value);
-                    stream_.put(store_[0..Offset + ubyte.sizeof]);
-                } else if (value < (1 << 16)) {
-                    // uint 16
-                    const temp = convertEndianTo!16(value);
-
-                    store_[0] = Format.UINT16;
-                    *cast(ushort*)&store_[Offset] = temp;
-                    stream_.put(store_[0..Offset + ushort.sizeof]);
-                } else {
-                    // uint 32
-                    const temp = convertEndianTo!32(value);
-
-                    store_[0] = Format.UINT32;
-                    *cast(uint*)&store_[Offset] = temp;
-                    stream_.put(store_[0..Offset + uint.sizeof]);
-                }
-            }
-        } else {
-            if (value < -(1L << 5)) {
-                if (value < -(1L << 15)) {
-                    if (value < -(1L << 31)) {
-                        // int 64
-                        const temp = convertEndianTo!64(value);
-
-                        store_[0] = Format.INT64;
-                        *cast(long*)&store_[Offset] = temp;
-                        stream_.put(store_[0..Offset + long.sizeof]);
-                    } else {
-                        // int 32
-                        const temp = convertEndianTo!32(value);
-
-                        store_[0] = Format.INT32;
-                        *cast(int*)&store_[Offset] = temp;
-                        stream_.put(store_[0..Offset + int.sizeof]);
-                    }
-                } else {
-                    if (value < -(1L << 7)) {
-                        // int 16
-                        const temp = convertEndianTo!16(value);
-
-                        store_[0] = Format.INT16;
-                        *cast(short*)&store_[Offset] = temp;
-                        stream_.put(store_[0..Offset + short.sizeof]);
-                    } else {
-                        // int 8
-                        store_[0] = Format.INT8;
-                        store_[1] = take8from!64(value);
-                        stream_.put(store_[0..Offset + byte.sizeof]);
-                    }
-                }
-            } else if (value < (1L << 7)) {
-                // fixnum
-                stream_.put(take8from!64(value));
-            } else {
-                if (value < (1L << 16)) {
-                    if (value < (1L << 8)) {
-                        // uint 8
-                        store_[0] = Format.UINT8;
-                        store_[1] = take8from!64(value);
-                        stream_.put(store_[0..Offset + ubyte.sizeof]);
-                    } else {
-                        // uint 16
-                        const temp = convertEndianTo!16(value);
-
-                        store_[0] = Format.UINT16;
-                        *cast(ushort*)&store_[Offset] = temp;
-                        stream_.put(store_[0..Offset + ushort.sizeof]);
-                    }
-                } else {
-                    if (value < (1L << 32)) {
-                        // uint 32
-                        const temp = convertEndianTo!32(value);
-
-                        store_[0] = Format.UINT32;
-                        *cast(uint*)&store_[Offset] = temp;
-                        stream_.put(store_[0..Offset + uint.sizeof]);
-                    } else {
-                        // uint 64
-                        const temp = convertEndianTo!64(value);
-
-                        store_[0] = Format.UINT64;
-                        *cast(ulong*)&store_[Offset] = temp;
-                        stream_.put(store_[0..Offset + ulong.sizeof]);
-                    }
-                }
-            }
-        }
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer pack(T)(in T value) if (isFloatingPoint!T && !is(Unqual!T == enum))
-    {
-        static if (is(Unqual!T == float)) {
-            const temp = convertEndianTo!32(_f(value).i);
-
-            store_[0] = Format.FLOAT;
-            *cast(uint*)&store_[Offset] = temp;
-            stream_.put(store_[0..Offset + uint.sizeof]);
-        } else static if (is(Unqual!T == double)) {
-            const temp = convertEndianTo!64(_d(value).i);
-
-            store_[0] = Format.DOUBLE;
-            *cast(ulong*)&store_[Offset] = temp;
-            stream_.put(store_[0..Offset + ulong.sizeof]);
-        } else {
-            static if ((real.sizeof > double.sizeof) && EnableReal) {
-                store_[0]      = Format.REAL;
-                const temp     = _r(value);
-                const fraction = convertEndianTo!64(temp.fraction);
-                const exponent = convertEndianTo!16(temp.exponent);
-
-                *cast(Unqual!(typeof(fraction))*)&store_[Offset]                   = fraction;
-                *cast(Unqual!(typeof(exponent))*)&store_[Offset + fraction.sizeof] = exponent;
-                stream_.put(store_[0..$]);
-            } else {  // Non-x86 CPUs, real type equals double type.
-                pack(cast(double)value);
-            }
-        }
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer pack(T)(in T value) if (is(Unqual!T == enum))
-    {
-        pack(cast(OriginalType!T)value);
-
-        return this;
-    }
-
-
-    /// Overload for pack(null) for 2.057 or later
-    static if (!is(typeof(null) == void*))
-    {
-        ref Packer pack(T)(in T value) if (is(Unqual!T == typeof(null)))
-        {
-            return packNil();
-        }
-    }
-
-
-    /// ditto
-    ref Packer pack(T)(in T value) if (isPointer!T)
-    {
-        static if (is(Unqual!T == void*)) {  // for pack(null) for 2.056 or earlier
-            enforce(value is null, "Can't serialize void type");
-            stream_.put(Format.NIL);
-        } else {
-            if (value is null)
-                stream_.put(Format.NIL);
-            else
-                pack(mixin(AsteriskOf!T ~ "value"));
-        }
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer pack(T)(in T array) if (isArray!T)
-    {
-        alias typeof(T.init[0]) U;
-
-        /*
-         * Serializes raw type-information to stream.
-         */
-        void beginRaw(in size_t length)
-        {
-            if (length < 32) {
-                const ubyte temp = Format.RAW | cast(ubyte)length;
-                stream_.put(take8from(temp));
-            } else if (length < 65536) {
-                const temp = convertEndianTo!16(length);
-
-                store_[0] = Format.RAW16;
-                *cast(ushort*)&store_[Offset] = temp;
-                stream_.put(store_[0..Offset + ushort.sizeof]);
-            } else {
-                const temp = convertEndianTo!32(length);
-
-                store_[0] = Format.RAW32;
-                *cast(uint*)&store_[Offset] = temp;
-                stream_.put(store_[0..Offset + uint.sizeof]);
-            }
-        }
-
-        if (array.empty)
-            return packNil();
-
-        // Raw bytes
-        static if (isByte!(U) || isSomeChar!(U)) {
-            ubyte[] raw = cast(ubyte[])array;
-
-            beginRaw(raw.length);
-            stream_.put(raw);
-        } else {
-            beginArray(array.length);
-            foreach (elem; array)
-                pack(elem);
-        }
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer pack(T)(in T array) if (isAssociativeArray!T)
-    {
-        if (array is null)
-            return packNil();
-
-        beginMap(array.length);
-        foreach (key, value; array) {
-            pack(key);
-            pack(value);
-        }
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer pack(Types...)(auto ref const Types objects) if (Types.length > 1)
-    {
-        foreach (i, T; Types)
-            pack(objects[i]);
-
-        return this;
-    }
-
-
-    /**
-     * Serializes $(D_PARAM object) and writes to stream.
-     *
-     * Calling $(D toMsgpack) if $(D_KEYWORD class) and $(D_KEYWORD struct) implement $(D toMsgpack) method. $(D toMsgpack) signature is:
-     * -----
-     * void toMsgpack(Packer)(ref Packer packer) const
-     * -----
-     * This method serializes all members of T object if $(D_KEYWORD class) and $(D_KEYWORD struct) don't implement $(D toMsgpack).
-     *
-     * An object that doesn't implement $(D toMsgpack) is serialized to Array type.
-     * -----
-     * packer.pack(tuple(true, 1, "Hi!"))  // -> '[true, 1, "Hi!"]', not 'ture, 1, "Hi!"'
-     *
-     * struct Foo
-     * {
-     *     int num    = 10;
-     *     string msg = "D!";
-     * }
-     * packer.pack(Foo());  // -> '[10, "D!"]'
-     *
-     * class Base
-     * {
-     *     bool flag = true;
-     * }
-     * class Derived : Base
-     * {
-     *     double = 0.5f;
-     * }
-     * packer.pack(new Derived());  // -> '[true, 0.5f]'
-     * -----
-     *
-     * Params:
-     *  object = the content to serialize.
-     *
-     * Returns:
-     *  self, i.e. for method chaining.
-     */
-    ref Packer pack(T)(in T object) if (is(Unqual!T == class))
-    {
-        if (object is null)
-            return packNil();
-
-        static if (hasMember!(T, "toMsgpack"))
-        {
-            static if (__traits(compiles, { T t; t.toMsgpack(this, withFieldName_); })) {
-                object.toMsgpack(this, withFieldName_);
-            } else static if (__traits(compiles, { T t; t.toMsgpack(this); })) { // backward compatible
-                object.toMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'toMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
-            }
-        } else {
-            // TODO: Add object serialization handler
-            if (T.classinfo !is object.classinfo) {
-                throw new MessagePackException("Can't pack derived class through reference to base class.");
-            }
-
-            alias SerializingClasses!(T) Classes;
-
-            immutable memberNum = SerializingMemberNumbers!(Classes);
-            if (withFieldName_)
-                beginMap(memberNum);
-            else
-                beginArray(memberNum);
-
-            foreach (Class; Classes) {
-                Class obj = cast(Class)object;
-                if (withFieldName_) {
-                    foreach (i, f ; obj.tupleof) {
-                        static if (isPackedField!(Class.tupleof[i])) {
-                            pack(getFieldName!(Class, i));
-                            pack(f);
-                        }
-                    }
-                } else {
-                    foreach (i, f ; obj.tupleof) {
-                        static if (isPackedField!(Class.tupleof[i]))
-                            pack(f);
-                    }
-                }
-            }
-        }
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer pack(T)(auto ref T object) if (is(Unqual!T == struct))
-    {
-        static if (hasMember!(T, "toMsgpack"))
-        {
-            static if (__traits(compiles, { T t; t.toMsgpack(this, withFieldName_); })) {
-                object.toMsgpack(this, withFieldName_);
-            } else static if (__traits(compiles, { T t; t.toMsgpack(this); })) { // backward compatible
-                object.toMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'toMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
-            }
-        } else static if (isTuple!T) {
-            beginArray(object.field.length);
-            foreach (f; object.field)
-                pack(f);
-        } else {  // simple struct
-            immutable memberNum = SerializingMemberNumbers!(T);
-            if (withFieldName_)
-                beginMap(memberNum);
-            else
-                beginArray(memberNum);
-
-            if (withFieldName_) {
-                foreach (i, f; object.tupleof) {
-                    static if (isPackedField!(T.tupleof[i]))
-                    {
-                        pack(getFieldName!(T, i));
-                        pack(f);
-                    }
-                }
-            } else {
-                foreach (i, f; object.tupleof) {
-                    static if (isPackedField!(T.tupleof[i]))
-                        pack(f);
-                }
-            }
-        }
-
-        return this;
-    }
-
-
-    /**
-     * Serializes the arguments as container to stream.
-     *
-     * -----
-     * packer.packArray(true, 1);  // -> [true, 1]
-     * packer.packMap("Hi", 100);  // -> ["Hi":100]
-     * -----
-     *
-     * In packMap, the number of arguments must be even.
-     *
-     * Params:
-     *  objects = the contents to serialize.
-     *
-     * Returns:
-     *  self, i.e. for method chaining.
-     */
-    ref Packer packArray(Types...)(auto ref const Types objects)
-    {
-        beginArray(Types.length);
-        foreach (i, T; Types)
-            pack(objects[i]);
-        //pack(objects);  // slow :(
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer packMap(Types...)(auto ref const Types objects)
-    {
-        static assert(Types.length % 2 == 0, "The number of arguments must be even");
-
-        beginMap(Types.length / 2);
-        foreach (i, T; Types)
-            pack(objects[i]);
-
-        return this;
-    }
-
-
-    /**
-     * Serializes the type-information to stream.
-     *
-     * These methods don't serialize contents.
-     * You need to call pack method to serialize contents at your own risk.
-     * -----
-     * packer.beginArray(3).pack(true, 1);  // -> [true, 1,
-     *
-     * // other operation
-     *
-     * packer.pack("Hi!");                  // -> [true, 1, "Hi!"]
-     * -----
-     *
-     * Params:
-     *  length = the length of container.
-     *
-     * Returns:
-     *  self, i.e. for method chaining.
-     */
-    ref Packer beginArray(in size_t length)
-    {
-        if (length < 16) {
-            const ubyte temp = Format.ARRAY | cast(ubyte)length;
-            stream_.put(take8from(temp));
-        } else if (length < 65536) {
-            const temp = convertEndianTo!16(length);
-
-            store_[0] = Format.ARRAY16;
-            *cast(ushort*)&store_[Offset] = temp;
-            stream_.put(store_[0..Offset + ushort.sizeof]);
-        } else {
-            const temp = convertEndianTo!32(length);
-
-            store_[0] = Format.ARRAY32;
-            *cast(uint*)&store_[Offset] = temp;
-            stream_.put(store_[0..Offset + uint.sizeof]);
-        }
-
-        return this;
-    }
-
-
-    /// ditto
-    ref Packer beginMap(in size_t length)
-    {
-        if (length < 16) {
-            const ubyte temp = Format.MAP | cast(ubyte)length;
-            stream_.put(take8from(temp));
-        } else if (length < 65536) {
-            const temp = convertEndianTo!16(length);
-
-            store_[0] = Format.MAP16;
-            *cast(ushort*)&store_[Offset] = temp;
-            stream_.put(store_[0..Offset + ushort.sizeof]);
-        } else {
-            const temp = convertEndianTo!32(length);
-
-            store_[0] = Format.MAP32;
-            *cast(uint*)&store_[Offset] = temp;
-            stream_.put(store_[0..Offset + uint.sizeof]);
-        }
-
-        return this;
-    }
-
-
-  private:
-    /*
-     * Serializes the nil value.
-     */
-    ref Packer packNil()
-    {
-        stream_.put(Format.NIL);
-        return this;
-    }
-}
-
-
-/**
- * Helper for $(D Packer) construction.
- *
- * Params:
- *  stream = the stream to write.
- *
- * Returns:
- *  a $(D Packer) object instantiated and initialized according to the arguments.
- */
-Packer!(Stream) packer(Stream)(Stream stream, bool withFieldName = false)
-{
-    return typeof(return)(stream, withFieldName);
-}
-
-
 version (unittest)
 {
-    alias Appender!(ubyte[]) SimpleBuffer;
-    alias packer packerBuilder;  // Avoid issue: http://d.puremagic.com/issues/show_bug.cgi?id=9169
-
     mixin template DefinePacker()
     {
-        SimpleBuffer buffer; Packer!(SimpleBuffer*) packer = packerBuilder(&buffer);
+        Packer packer;
     }
 
     mixin template DefineDictionalPacker()
     {
-        SimpleBuffer buffer; Packer!(SimpleBuffer*) packer = packerBuilder(&buffer, true);
+        Packer packer = Packer(false);
     }
 }
 
@@ -1050,7 +1261,7 @@ unittest
 
         enum : ulong { A = ubyte.max, B = ushort.max, C = uint.max, D = ulong.max }
 
-        static UTest[][] tests = [
+        static UTest[][] utests = [
             [{Format.UINT8, A}],
             [{Format.UINT8, A}, {Format.UINT16, B}],
             [{Format.UINT8, A}, {Format.UINT16, B}, {Format.UINT32, C}],
@@ -1058,28 +1269,28 @@ unittest
         ];
 
         foreach (I, T; TypeTuple!(ubyte, ushort, uint, ulong)) {
-            foreach (i, test; tests[I]) {
+            foreach (i, test; utests[I]) {
                 mixin DefinePacker;
 
                 packer.pack(cast(T)test.value);
-                assert(buffer.data[0] == test.format);
+                assert(packer.stream.data[0] == test.format);
 
                 switch (i) {
                 case 0:
                     auto answer = take8from!(T.sizeof * 8)(test.value);
-                    assert(memcmp(&buffer.data[1], &answer, ubyte.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, ubyte.sizeof) == 0);
                     break;
                 case 1:
                     auto answer = convertEndianTo!16(test.value);
-                    assert(memcmp(&buffer.data[1], &answer, ushort.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, ushort.sizeof) == 0);
                     break;
                 case 2:
                     auto answer = convertEndianTo!32(test.value);
-                    assert(memcmp(&buffer.data[1], &answer, uint.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, uint.sizeof) == 0);
                     break;
                 default:
                     auto answer = convertEndianTo!64(test.value);
-                    assert(memcmp(&buffer.data[1], &answer, ulong.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, ulong.sizeof) == 0);
                 }
             }
         }
@@ -1089,7 +1300,7 @@ unittest
 
         enum : long { A = byte.min, B = short.min, C = int.min, D = long.min }
 
-        static STest[][] tests = [
+        static STest[][] stests = [
             [{Format.INT8, A}],
             [{Format.INT8, A}, {Format.INT16, B}],
             [{Format.INT8, A}, {Format.INT16, B}, {Format.INT32, C}],
@@ -1097,28 +1308,28 @@ unittest
         ];
 
         foreach (I, T; TypeTuple!(byte, short, int, long)) {
-            foreach (i, test; tests[I]) {
+            foreach (i, test; stests[I]) {
                 mixin DefinePacker;
 
                 packer.pack(cast(T)test.value);
-                assert(buffer.data[0] == test.format);
+                assert(packer.stream.data[0] == test.format);
 
                 switch (i) {
                 case 0:
                     auto answer = take8from!(T.sizeof * 8)(test.value);
-                    assert(memcmp(&buffer.data[1], &answer, byte.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, byte.sizeof) == 0);
                     break;
                 case 1:
                     auto answer = convertEndianTo!16(test.value);
-                    assert(memcmp(&buffer.data[1], &answer, short.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, short.sizeof) == 0);
                     break;
                 case 2:
                     auto answer = convertEndianTo!32(test.value);
-                    assert(memcmp(&buffer.data[1], &answer, int.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, int.sizeof) == 0);
                     break;
                 default:
                     auto answer = convertEndianTo!64(test.value);
-                    assert(memcmp(&buffer.data[1], &answer, long.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, long.sizeof) == 0);
                 }
             }
         }
@@ -1129,7 +1340,7 @@ unittest
             alias TypeTuple!(float, double, double) FloatingTypes;
             static struct FTest { ubyte format; double value; }
 
-            static FTest[] tests = [
+            static FTest[] ftests = [
                 {Format.FLOAT,  float.min_normal},
                 {Format.DOUBLE, double.max},
                 {Format.DOUBLE, double.max},
@@ -1140,7 +1351,7 @@ unittest
             alias TypeTuple!(float, double, real) FloatingTypes;
             static struct FTest { ubyte format; real value; }
 
-            static FTest[] tests = [
+            static FTest[] ftests = [
                 {Format.FLOAT,  float.min_normal},
                 {Format.DOUBLE, double.max},
                 {Format.REAL,   real.max},
@@ -1150,31 +1361,31 @@ unittest
         foreach (I, T; FloatingTypes) {
             mixin DefinePacker;
 
-            packer.pack(cast(T)tests[I].value);
-            assert(buffer.data[0] == tests[I].format);
+            packer.pack(cast(T)ftests[I].value);
+            assert(packer.stream.data[0] == ftests[I].format);
 
             switch (I) {
             case 0:
-                const answer = convertEndianTo!32(_f(cast(T)tests[I].value).i);
-                assert(memcmp(&buffer.data[1], &answer, float.sizeof) == 0);
+                const answer = convertEndianTo!32(_f(cast(T)ftests[I].value).i);
+                assert(memcmp(&packer.stream.data[1], &answer, float.sizeof) == 0);
                 break;
             case 1:
-                const answer = convertEndianTo!64(_d(cast(T)tests[I].value).i);
-                assert(memcmp(&buffer.data[1], &answer, double.sizeof) == 0);
+                const answer = convertEndianTo!64(_d(cast(T)ftests[I].value).i);
+                assert(memcmp(&packer.stream.data[1], &answer, double.sizeof) == 0);
                 break;
             default:
                 static if (EnableReal)
                 {
-                    const t = _r(cast(T)tests[I].value);
+                    const t = _r(cast(T)ftests[I].value);
                     const f = convertEndianTo!64(t.fraction);
                     const e = convertEndianTo!16(t.exponent);
-                    assert(memcmp(&buffer.data[1],            &f, f.sizeof) == 0);
-                    assert(memcmp(&buffer.data[1 + f.sizeof], &e, e.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1],            &f, f.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1 + f.sizeof], &e, e.sizeof) == 0);
                 }
                 else
                 {
-                    const answer = convertEndianTo!64(_d(cast(T)tests[I].value).i);
-                    assert(memcmp(&buffer.data[1], &answer, double.sizeof) == 0);
+                    const answer = convertEndianTo!64(_d(cast(T)ftests[I].value).i);
+                    assert(memcmp(&packer.stream.data[1], &answer, double.sizeof) == 0);
                 }
             }
         }
@@ -1192,7 +1403,7 @@ unittest
             }
         }
 
-        PTest[] tests = [PTest(Format.UINT64), PTest(Format.INT64), PTest(Format.DOUBLE)];
+        PTest[] ptests = [PTest(Format.UINT64), PTest(Format.INT64), PTest(Format.DOUBLE)];
 
         ulong  v0 = ulong.max;
         long   v1 = long.min;
@@ -1201,23 +1412,23 @@ unittest
         foreach (I, Index; TypeTuple!("0", "1", "2")) {
             mixin DefinePacker;
 
-            mixin("tests[I].p" ~ Index ~ " = &v" ~ Index ~ ";");
+            mixin("ptests[I].p" ~ Index ~ " = &v" ~ Index ~ ";");
 
-            packer.pack(mixin("tests[I].p" ~ Index));
-            assert(buffer.data[0] == tests[I].format);
+            packer.pack(mixin("ptests[I].p" ~ Index));
+            assert(packer.stream.data[0] == ptests[I].format);
 
             switch (I) {
             case 0:
-                auto answer = convertEndianTo!64(*tests[I].p0);
-                assert(memcmp(&buffer.data[1], &answer, ulong.sizeof) == 0);
+                auto answer = convertEndianTo!64(*ptests[I].p0);
+                assert(memcmp(&packer.stream.data[1], &answer, ulong.sizeof) == 0);
                 break;
             case 1:
-                auto answer = convertEndianTo!64(*tests[I].p1);
-                assert(memcmp(&buffer.data[1], &answer, long.sizeof) == 0);
+                auto answer = convertEndianTo!64(*ptests[I].p1);
+                assert(memcmp(&packer.stream.data[1], &answer, long.sizeof) == 0);
                 break;
             default:
-                const answer = convertEndianTo!64(_d(*tests[I].p2).i);
-                assert(memcmp(&buffer.data[1], &answer, double.sizeof) == 0);
+                const answer = convertEndianTo!64(_d(*ptests[I].p2).i);
+                assert(memcmp(&packer.stream.data[1], &answer, double.sizeof) == 0);
             }
         }
     }
@@ -1227,42 +1438,42 @@ unittest
         mixin DefinePacker; E e = E.A;
 
         packer.pack(e);
-        assert(buffer.data[0] == Format.UINT8);
+        assert(packer.stream.data[0] == Format.UINT8);
 
         auto answer = E.A;
-        assert(memcmp(&buffer.data[1], &answer, (OriginalType!E).sizeof) == 0);
+        assert(memcmp(&packer.stream.data[1], &answer, (OriginalType!E).sizeof) == 0);
     }
     { // container
-        static struct Test { ubyte format; size_t value; }
+        static struct CTest { ubyte format; size_t value; }
 
         enum : ulong { A = 16 / 2, B = ushort.max, C = uint.max }
 
-        static Test[][] tests = [
+        static CTest[][] ctests = [
             [{Format.ARRAY | A, Format.ARRAY | A}, {Format.ARRAY16, B}, {Format.ARRAY32, C}],
             [{Format.MAP   | A, Format.MAP   | A}, {Format.MAP16,   B}, {Format.MAP32,   C}],
         ];
 
         foreach (I, Name; TypeTuple!("Array", "Map")) {
-            auto test = tests[I];
+            auto test = ctests[I];
 
             foreach (i, T; TypeTuple!(ubyte, ushort, uint)) {
                 mixin DefinePacker;
                 mixin("packer.begin" ~ Name ~ "(i ? test[i].value : A);");
 
-                assert(buffer.data[0] == test[i].format);
+                assert(packer.stream.data[0] == test[i].format);
 
                 switch (i) {
                 case 0:
                     auto answer = take8from(test[i].value);
-                    assert(memcmp(&buffer.data[0], &answer, ubyte.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[0], &answer, ubyte.sizeof) == 0);
                     break;
                 case 1:
                     auto answer = convertEndianTo!16(test[i].value);
-                    assert(memcmp(&buffer.data[1], &answer, ushort.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, ushort.sizeof) == 0);
                     break;
                 default:
                     auto answer = convertEndianTo!32(test[i].value);
-                    assert(memcmp(&buffer.data[1], &answer, uint.sizeof) == 0);
+                    assert(memcmp(&packer.stream.data[1], &answer, uint.sizeof) == 0);
                 }
             }
         }
@@ -1280,20 +1491,20 @@ unittest
 
             packer.pack(test);
 
-            assert(buffer.data[0] == (Format.ARRAY | 1));
-            assert(buffer.data[1] ==  Format.UINT32);
-            assert(memcmp(&buffer.data[2], &test.num, uint.sizeof) == 0);
+            assert(packer.stream.data[0] == (Format.ARRAY | 1));
+            assert(packer.stream.data[1] ==  Format.UINT32);
+            assert(memcmp(&packer.stream.data[2], &test.num, uint.sizeof) == 0);
         }
         {
             mixin DefinePacker; auto test = tuple(true, false, uint.max);
 
             packer.pack(test);
 
-            assert(buffer.data[0] == (Format.ARRAY | 3));
-            assert(buffer.data[1] ==  Format.TRUE);
-            assert(buffer.data[2] ==  Format.FALSE);
-            assert(buffer.data[3] ==  Format.UINT32);
-            assert(memcmp(&buffer.data[4], &test.field[2], uint.sizeof) == 0);
+            assert(packer.stream.data[0] == (Format.ARRAY | 3));
+            assert(packer.stream.data[1] ==  Format.TRUE);
+            assert(packer.stream.data[2] ==  Format.FALSE);
+            assert(packer.stream.data[3] ==  Format.UINT32);
+            assert(memcmp(&packer.stream.data[4], &test.field[2], uint.sizeof) == 0);
         }
         {
             static class C
@@ -1309,9 +1520,9 @@ unittest
 
             packer.pack(test);
 
-            assert(buffer.data[0] == (Format.ARRAY | 1));
-            assert(buffer.data[1] ==  Format.UINT16);
-            assert(memcmp(&buffer.data[2], &test.num, ushort.sizeof) == 0);
+            assert(packer.stream.data[0] == (Format.ARRAY | 1));
+            assert(packer.stream.data[1] ==  Format.UINT16);
+            assert(memcmp(&packer.stream.data[2], &test.num, ushort.sizeof) == 0);
         }
     }
     { // simple struct and class
@@ -1346,9 +1557,9 @@ unittest
                 Type test;
                 packer.pack(test);
 
-                assert(buffer.data[0] == (Format.ARRAY | 1));
-                assert(buffer.data[1] ==  Format.UINT32);
-                assert(memcmp(&buffer.data[2], &test.num, uint.sizeof) == 0);
+                assert(packer.stream.data[0] == (Format.ARRAY | 1));
+                assert(packer.stream.data[1] ==  Format.UINT32);
+                assert(memcmp(&packer.stream.data[2], &test.num, uint.sizeof) == 0);
             }
         }
 
@@ -1393,11 +1604,11 @@ unittest
                 Type test = new Type();
                 packer.pack(test);
 
-                assert(buffer.data[0] == (Format.ARRAY | 3));
-                assert(buffer.data[1] ==  Format.TRUE);
-                assert(buffer.data[2] ==  100);
-                assert(buffer.data[3] ==  Format.UINT32);
-                assert(memcmp(&buffer.data[4], &test.num, uint.sizeof) == 0);
+                assert(packer.stream.data[0] == (Format.ARRAY | 3));
+                assert(packer.stream.data[1] ==  Format.TRUE);
+                assert(packer.stream.data[2] ==  100);
+                assert(packer.stream.data[3] ==  Format.UINT32);
+                assert(memcmp(&packer.stream.data[4], &test.num, uint.sizeof) == 0);
             }
         }
         {  // from base class
@@ -1681,6 +1892,19 @@ else
 struct Unpacker
 {
   private:
+    static @system
+    {
+        alias void delegate(ref Unpacker, void*) UnpackHandler;
+        UnpackHandler[TypeInfo] unpackHandlers;
+
+        public void registerHandler(T, alias Handler)()
+        {
+            unpackHandlers[typeid(T)] = delegate(ref Unpacker unpacker, void* obj) {
+                Handler(unpacker, *cast(T*)obj);
+            };
+        }
+    }
+
     enum Offset = 1;
 
     mixin InternalBuffer;
@@ -2159,13 +2383,17 @@ struct Unpacker
         {
             static if (__traits(compiles, { T t; t.fromMsgpack(this, withFieldName_); })) {
               object.fromMsgpack(this, withFieldName_);
-            } else static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { // backward compatible
-                object.fromMsgpack(this);
+            /* } else static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { // backward compatible */
+            /*     object.fromMsgpack(this); */
             } else {
-                static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
+                object.fromMsgpack(this);
+                /* static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
             }
         } else {
-            // TODO: Add object deserialization handler
+            if (auto handler = object.classinfo in unpackHandlers) {
+                (*handler)(this, cast(void*)&object);
+                return this;
+            }
             if (T.classinfo !is object.classinfo) {
                 throw new MessagePackException("Can't unpack derived class through reference to base class.");
             }
@@ -2223,12 +2451,19 @@ struct Unpacker
     {
         static if (hasMember!(T, "fromMsgpack"))
         {
-            static if (__traits(compiles, { T t; t.fromMsgpack(this); })) {
-                object.fromMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
-            }
+            // Note: Disabled to support T's with no default constructor such as NonNull.
+            /* static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { */
+            /*     object.fromMsgpack(this); */
+            /* } else { */
+            object.fromMsgpack(this);
+            /*     static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
+            /* } */
         } else {
+            if (auto handler = typeid(T) in unpackHandlers) {
+                (*handler)(this, cast(void*)&object);
+                return this;
+            }
+
             auto length = beginArray();
             if (length == 0)
                 return this;
@@ -2532,6 +2767,20 @@ struct Unpacker
         offset_ -= size + Offset;
         onInvalidType();
     }
+}
+
+
+/**
+ * Register a deserialization handler for $(D_PARAM T) type
+ *
+ * Example:
+ * -----
+ * registerUnackHandler!(Foo, fooUnackHandler);
+ * -----
+ */
+void registerUnpackHandler(T, alias Handler)()
+{
+    Unpacker.registerHandler!(T, Handler);
 }
 
 
@@ -3114,11 +3363,12 @@ struct Value
 
         static if (hasMember!(T, "fromMsgpack"))
         {
-            static if (__traits(compiles, { T t; t.fromMsgpack(this); })) {
-                object.fromMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
-            }
+            /* static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { */
+            /*     object.fromMsgpack(this); */
+            /* } else { */
+            object.fromMsgpack(this);
+            /*     static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
+            /* } */
         } else {
             alias SerializingClasses!(T) Classes;
 
@@ -3147,11 +3397,12 @@ struct Value
 
         static if (hasMember!(T, "fromMsgpack"))
         {
-            static if (__traits(compiles, { T t; t.fromMsgpack(this); })) {
-                obj.fromMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
-            }
+            /* static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { */
+            /*     obj.fromMsgpack(this); */
+            /* } else { */
+            obj.fromMsgpack(this);
+            /*     static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
+            /* } */
         } else {
             static if (isTuple!T) {
                 if (via.array.length != T.Types.length)
@@ -3823,7 +4074,6 @@ struct StreamingUnpacker
 
         bool   ret;
         size_t cur = offset_;
-        size_t base;
         Value obj;
 
         // restores before state
@@ -3831,7 +4081,6 @@ struct StreamingUnpacker
         auto trail =  context_.trail;
         auto top   =  context_.top;
         auto stack = &context_.stack;
-        typeof(&(*stack)[0]) container;
 
         /*
          * Helper for container deserialization
@@ -3867,19 +4116,19 @@ struct StreamingUnpacker
                     goto Lpush;
                 } else if (0xa0 <= header && header <= 0xbf) {  // fix raw
                     trail = header & 0x1f;
-                    if (trail == 0)
-                        goto Lraw;
                     state = State.RAW;
                     cur++;
-                    goto Lstart;
+                    continue;
                 } else if (0x90 <= header && header <= 0x9f) {  // fix array
                     if (!startContainer!"Array"(ContainerElement.ARRAY_ITEM, header & 0x0f))
                         goto Lpush;
-                    goto Lagain;
+                    cur++;
+                    continue;
                 } else if (0x80 <= header && header <= 0x8f) {  // fix map
                     if (!startContainer!"Map"(ContainerElement.MAP_KEY, header & 0x0f))
                         goto Lpush;
-                    goto Lagain;
+                    cur++;
+                    continue;
                 } else {
                     switch (header) {
                     case Format.UINT8, Format.UINT16, Format.UINT32, Format.UINT64,
@@ -3929,7 +4178,7 @@ struct StreamingUnpacker
                 if (used_ - cur < trail)
                     goto Labort;
 
-                base = cur; cur += trail - 1;  // fix current position
+                const base = cur; cur += trail - 1;  // fix current position
 
                 final switch (state) {
                 case State.FLOAT:
@@ -4025,22 +4274,30 @@ struct StreamingUnpacker
                     if (!startContainer!"Array"(ContainerElement.ARRAY_ITEM,
                                                 load16To!size_t(buffer_[base..base + trail])))
                         goto Lpush;
-                    goto Lagain;
+                    state = State.HEADER;
+                    cur++;
+                    continue;
                 case State.ARRAY36:
                     if (!startContainer!"Array"(ContainerElement.ARRAY_ITEM,
                                                 load32To!size_t(buffer_[base..base + trail])))
                         goto Lpush;
-                    goto Lagain;
+                    state = State.HEADER;
+                    cur++;
+                    continue;
                 case State.MAP16:
                     if (!startContainer!"Map"(ContainerElement.MAP_KEY,
                                               load16To!size_t(buffer_[base..base + trail])))
                         goto Lpush;
-                    goto Lagain;
+                    state = State.HEADER;
+                    cur++;
+                    continue;
                 case State.MAP32:
                     if (!startContainer!"Map"(ContainerElement.MAP_KEY,
                                               load32To!size_t(buffer_[base..base + trail])))
                         goto Lpush;
-                    goto Lagain;
+                    state = State.HEADER;
+                    cur++;
+                    continue;
                 case State.HEADER:
                     break;
                 }
@@ -4050,7 +4307,7 @@ struct StreamingUnpacker
             if (top == 0)
                 goto Lfinish;
 
-            container = &(*stack)[top - 1];
+            auto container = &(*stack)[top - 1];
 
             final switch (container.type) {
             case ContainerElement.ARRAY_ITEM:
@@ -4075,7 +4332,6 @@ struct StreamingUnpacker
                 container.type = ContainerElement.MAP_KEY;
             }
 
-          Lagain:
             state = State.HEADER;
             cur++;
         } while (cur < used_);
@@ -4328,147 +4584,7 @@ pure void onInvalidType()
 public:
 
 
-// Convenient functions
-
-
-/**
- * Serializes $(D_PARAM args).
- *
- * Assumes single object if the length of $(D_PARAM args) == 1,
- * otherwise array object.
- *
- * Params:
- *  args = the contents to serialize.
- *
- * Returns:
- *  a serialized data.
- */
-ubyte[] pack(bool withFieldName = false, Args...)(in Args args)
-{
-    auto packer = packer(Appender!(ubyte[])(), withFieldName);
-
-    static if (Args.length == 1)
-        packer.pack(args[0]);
-    else
-        packer.packArray(args);
-
-    return packer.stream.data;
-}
-
-
-unittest
-{
-    auto serialized = pack(false);
-
-    assert(serialized[0] == Format.FALSE);
-
-    auto deserialized = unpack(pack(1, true, "Foo"));
-
-    assert(deserialized.type == Value.Type.array);
-    assert(deserialized.via.array[0].type == Value.Type.unsigned);
-    assert(deserialized.via.array[1].type == Value.Type.boolean);
-    assert(deserialized.via.array[2].type == Value.Type.raw);
-}
-
-
-/**
- * Deserializes $(D_PARAM buffer) using stream deserializer.
- *
- * Params:
- *  buffer = the buffer to deserialize.
- *
- * Returns:
- *  a $(D Unpacked) contains deserialized object.
- *
- * Throws:
- *  UnpackException if deserialization doesn't succeed.
- */
-Unpacked unpack(Tdummy = void)(in ubyte[] buffer)
-{
-    auto unpacker = StreamingUnpacker(buffer);
-
-    if (!unpacker.execute())
-        throw new UnpackException("Deserialization failure");
-
-    return unpacker.unpacked;
-}
-
-
-/**
- * Deserializes $(D_PARAM buffer) using direct-conversion deserializer.
- *
- * Assumes single object if the length of $(D_PARAM args) == 1,
- * otherwise array object.
- *
- * Params:
- *  buffer = the buffer to deserialize.
- *  args   = the references of values to assign.
- */
-void unpack(bool withFieldName = false, Args...)(in ubyte[] buffer, ref Args args)
-{
-    auto unpacker = Unpacker(buffer, 8192, withFieldName);
-
-    static if (Args.length == 1)
-        unpacker.unpack(args[0]);
-    else
-        unpacker.unpackArray(args);
-}
-
-
-unittest
-{
-    { // stream
-        auto result = unpack(pack(false));
-
-        assert(result.via.boolean == false);
-    }
-    { // direct conversion
-        Tuple!(uint, string) result;
-        Tuple!(uint, string) test = tuple(1, "Hi!");
-
-        unpack(pack(test), result);
-        assert(result == test);
-
-        test.field[0] = 2;
-        test.field[1] = "Hey!";
-        unpack(pack(test.field[0], test.field[1]), result.field[0], result.field[1]);
-        assert(result == test);
-    }
-    { // serialize object as a Map
-        static class C
-        {
-            int num;
-
-            this(int num) { this.num = num; }
-        }
-
-        auto test = new C(10);
-        auto result = new C(100);
-
-        unpack!(true)(pack!(true)(test), result);
-        assert(result.num == 10, "Unpacking with field names failed");
-    }
-}
-
-
-unittest
-{
-    // unittest for https://github.com/msgpack/msgpack-d/issues/8
-    foreach (Type; TypeTuple!(byte, short, int, long)) {
-        foreach (i; [-33, -20, -1, 0, 1, 20, 33]) {
-            Type a = cast(Type)i;
-            Type b;
-            unpack(pack(a), b);
-            assert(a == b);
-        }
-    }
-}
-
-
-// Utilities template
-
-
-/**
+/*
  * Handy helper for creating MessagePackable object.
  *
  * toMsgpack / fromMsgpack are special methods for serialization / deserialization.
