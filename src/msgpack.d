@@ -789,10 +789,10 @@ struct PackerImpl(Stream) if (isOutputRange!(Stream, ubyte) && isOutputRange!(St
         {
             static if (__traits(compiles, { T t; t.toMsgpack(this, withFieldName_); })) {
                 object.toMsgpack(this, withFieldName_);
-            } else static if (__traits(compiles, { T t; t.toMsgpack(this); })) { // backward compatible
+            } else /* static if (__traits(compiles, { T t; t.toMsgpack(this); })) */ { // backward compatible
                 object.toMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'toMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
+            /* } else { */
+            /*     static assert(0, "Failed to invoke 'toMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
             }
         } else {
             if (auto handler = object.classinfo in packHandlers) {
@@ -841,10 +841,10 @@ struct PackerImpl(Stream) if (isOutputRange!(Stream, ubyte) && isOutputRange!(St
         {
             static if (__traits(compiles, { T t; t.toMsgpack(this, withFieldName_); })) {
                 object.toMsgpack(this, withFieldName_);
-            } else static if (__traits(compiles, { T t; t.toMsgpack(this); })) { // backward compatible
+            } else /* static if (__traits(compiles, { T t; t.toMsgpack(this); })) */ { // backward compatible
                 object.toMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'toMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
+            /* } else { */
+            /*     static assert(0, "Failed to invoke 'toMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
             }
         } else static if (isTuple!T) {
             beginArray(object.field.length);
@@ -2381,10 +2381,10 @@ struct Unpacker
         {
             static if (__traits(compiles, { T t; t.fromMsgpack(this, withFieldName_); })) {
               object.fromMsgpack(this, withFieldName_);
-            } else static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { // backward compatible
+            } else /* static if (__traits(compiles, { T t; t.fromMsgpack(this); })) */ { // backward compatible
                 object.fromMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
+            /* } else { */
+            /*     static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
             }
         } else {
             if (auto handler = object.classinfo in unpackHandlers) {
@@ -2448,11 +2448,11 @@ struct Unpacker
     {
         static if (hasMember!(T, "fromMsgpack"))
         {
-            static if (__traits(compiles, { T t; t.fromMsgpack(this); })) {
-                object.fromMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
-            }
+            /* static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { */
+            object.fromMsgpack(this);
+            /* } else { */
+            /*     static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
+            /* } */
         } else {
             if (auto handler = typeid(T) in unpackHandlers) {
                 (*handler)(this, cast(void*)&object);
@@ -3358,11 +3358,11 @@ struct Value
 
         static if (hasMember!(T, "fromMsgpack"))
         {
-            static if (__traits(compiles, { T t; t.fromMsgpack(this); })) {
-                object.fromMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
-            }
+            /* static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { */
+            object.fromMsgpack(this);
+            /* } else { */
+            /*     static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
+            /* } */
         } else {
             alias SerializingClasses!(T) Classes;
 
@@ -3391,11 +3391,11 @@ struct Value
 
         static if (hasMember!(T, "fromMsgpack"))
         {
-            static if (__traits(compiles, { T t; t.fromMsgpack(this); })) {
-                obj.fromMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
-            }
+            /* static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { */
+            obj.fromMsgpack(this);
+            /* } else { */
+            /*     static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
+            /* } */
         } else {
             static if (isTuple!T) {
                 if (via.array.length != T.Types.length)
