@@ -3579,187 +3579,187 @@ struct Value
 }
 
 
-unittest
-{
-    // nil
-    Value value = Value(null);
-    Value other = Value();
+/* unittest */
+/* { */
+/*     // nil */
+/*     Value value = Value(null); */
+/*     Value other = Value(); */
 
-    assert(value      == other);
-    assert(value.type == Value.Type.nil);
+/*     assert(value      == other); */
+/*     assert(value.type == Value.Type.nil); */
 
-    // boolean
-    value = Value(true);
-    other = Value(false);
+/*     // boolean */
+/*     value = Value(true); */
+/*     other = Value(false); */
 
-    assert(value           != other);
-    assert(value.type      == Value.Type.boolean);
-    assert(value.as!(bool) == true);
-    assert(other           == false);
+/*     assert(value           != other); */
+/*     assert(value.type      == Value.Type.boolean); */
+/*     assert(value.as!(bool) == true); */
+/*     assert(other           == false); */
 
-    try {
-        auto b = value.as!(uint);
-        assert(false);
-    } catch (MessagePackException e) { }
+/*     try { */
+/*         auto b = value.as!(uint); */
+/*         assert(false); */
+/*     } catch (MessagePackException e) { } */
 
-    // unsigned integer
-    value = Value(10UL);
-    other = Value(10UL);
+/*     // unsigned integer */
+/*     value = Value(10UL); */
+/*     other = Value(10UL); */
 
-    assert(value           == other);
-    assert(value.type      == Value.Type.unsigned);
-    assert(value.as!(uint) == 10);
-    assert(other           == 10UL);
+/*     assert(value           == other); */
+/*     assert(value.type      == Value.Type.unsigned); */
+/*     assert(value.as!(uint) == 10); */
+/*     assert(other           == 10UL); */
 
-    // signed integer
-    value = Value(-20L);
-    other = Value(-10L);
+/*     // signed integer */
+/*     value = Value(-20L); */
+/*     other = Value(-10L); */
 
-    assert(value          != other);
-    assert(value.type     == Value.Type.signed);
-    assert(value.as!(int) == -20);
-    assert(other          == -10L);
+/*     assert(value          != other); */
+/*     assert(value.type     == Value.Type.signed); */
+/*     assert(value.as!(int) == -20); */
+/*     assert(other          == -10L); */
 
-    // enum
-    enum E : int { F = -20 }
+/*     // enum */
+/*     enum E : int { F = -20 } */
 
-    E e = value.as!(E);
-    assert(e == E.F);
+/*     E e = value.as!(E); */
+/*     assert(e == E.F); */
 
-    // floating point
-    value = Value(0.1e-10L);
-    other = Value(0.1e-20L);
+/*     // floating point */
+/*     value = Value(0.1e-10L); */
+/*     other = Value(0.1e-20L); */
 
-    assert(value           != other);
-    assert(value.type      == Value.Type.floating);
-    assert(value.as!(real) == 0.1e-10L);
-    assert(other           == 0.1e-20L);
+/*     assert(value           != other); */
+/*     assert(value.type      == Value.Type.floating); */
+/*     assert(value.as!(real) == 0.1e-10L); */
+/*     assert(other           == 0.1e-20L); */
 
-    // raw
-    value = Value(cast(ubyte[])[72, 105, 33]);
-    other = Value(cast(ubyte[])[72, 105, 33]);
+/*     // raw */
+/*     value = Value(cast(ubyte[])[72, 105, 33]); */
+/*     other = Value(cast(ubyte[])[72, 105, 33]); */
 
-    assert(value             == other);
-    assert(value.type        == Value.Type.raw);
-    assert(value.as!(string) == "Hi!");
-    assert(other             == cast(ubyte[])[72, 105, 33]);
+/*     assert(value             == other); */
+/*     assert(value.type        == Value.Type.raw); */
+/*     assert(value.as!(string) == "Hi!"); */
+/*     assert(other             == cast(ubyte[])[72, 105, 33]); */
 
-    // raw with string
-    value = Value("hello");
-    other = Value("hello");
+/*     // raw with string */
+/*     value = Value("hello"); */
+/*     other = Value("hello"); */
 
-    assert(value             == other);
-    assert(value.type        == Value.Type.raw);
-    assert(value.as!(string) == "hello");
+/*     assert(value             == other); */
+/*     assert(value.type        == Value.Type.raw); */
+/*     assert(value.as!(string) == "hello"); */
 
-    // enum : string
-    enum EStr : string { elem = "hello" }
+/*     // enum : string */
+/*     enum EStr : string { elem = "hello" } */
 
-    assert(value.as!(EStr) == EStr.elem);
+/*     assert(value.as!(EStr) == EStr.elem); */
 
-    // array
-    auto t = Value(cast(ubyte[])[72, 105, 33]);
-    value = Value([t]);
-    other = Value([t]);
+/*     // array */
+/*     auto t = Value(cast(ubyte[])[72, 105, 33]); */
+/*     value = Value([t]); */
+/*     other = Value([t]); */
 
-    assert(value               == other);
-    assert(value.type          == Value.Type.array);
-    assert(value.as!(string[]) == ["Hi!"]);
-    assert(other               == [t]);
+/*     assert(value               == other); */
+/*     assert(value.type          == Value.Type.array); */
+/*     assert(value.as!(string[]) == ["Hi!"]); */
+/*     assert(other               == [t]); */
 
-    // map
-    value = Value([Value(1L):Value(2L)]);
-    other = Value([Value(1L):Value(1L)]);
+/*     // map */
+/*     value = Value([Value(1L):Value(2L)]); */
+/*     other = Value([Value(1L):Value(1L)]); */
 
-    assert(value               != other);
-    assert(value.type          == Value.Type.map);
-    assert(value.as!(int[int]) == [1:2]);
-    assert(other               == [Value(1L):Value(1L)]);
+/*     assert(value               != other); */
+/*     assert(value.type          == Value.Type.map); */
+/*     assert(value.as!(int[int]) == [1:2]); */
+/*     assert(other               == [Value(1L):Value(1L)]); */
 
-    value = Value(10UL);
+/*     value = Value(10UL); */
 
-    // struct
-    static struct S
-    {
-        ulong num;
+/*     // struct */
+/*     static struct S */
+/*     { */
+/*         ulong num; */
 
-        void fromMsgpack(Value value) { num = value.via.uinteger; }
-    }
+/*         void fromMsgpack(Value value) { num = value.via.uinteger; } */
+/*     } */
 
-    S s = value.as!(S);
-    assert(s.num == 10);
+/*     S s = value.as!(S); */
+/*     assert(s.num == 10); */
 
-    value = Value([Value(0.5f), Value(cast(ubyte[])[72, 105, 33])]);
+/*     value = Value([Value(0.5f), Value(cast(ubyte[])[72, 105, 33])]); */
 
-    // struct
-    static struct Simple
-    {
-        @nonPacked int era;
-        double num;
-        string msg;
-    }
+/*     // struct */
+/*     static struct Simple */
+/*     { */
+/*         @nonPacked int era; */
+/*         double num; */
+/*         string msg; */
+/*     } */
 
-    Simple simple = value.as!(Simple);
-    assert(simple.era == int.init);
-    assert(simple.num == 0.5f);
-    assert(simple.msg == "Hi!");
+/*     Simple simple = value.as!(Simple); */
+/*     assert(simple.era == int.init); */
+/*     assert(simple.num == 0.5f); */
+/*     assert(simple.msg == "Hi!"); */
 
-    value = Value(10UL);
+/*     value = Value(10UL); */
 
-    // class
-    static class C
-    {
-        ulong num;
+/*     // class */
+/*     static class C */
+/*     { */
+/*         ulong num; */
 
-        void fromMsgpack(Value value) { num = value.via.uinteger; }
-    }
+/*         void fromMsgpack(Value value) { num = value.via.uinteger; } */
+/*     } */
 
-    C c = value.as!(C);
-    assert(c.num == 10);
+/*     C c = value.as!(C); */
+/*     assert(c.num == 10); */
 
-    static class SimpleA
-    {
-        bool flag = true;
-    }
+/*     static class SimpleA */
+/*     { */
+/*         bool flag = true; */
+/*     } */
 
-    static class SimpleB : SimpleA
-    {
-        ubyte type = 100;
-    }
+/*     static class SimpleB : SimpleA */
+/*     { */
+/*         ubyte type = 100; */
+/*     } */
 
-    static class SimpleC : SimpleB
-    {
-        @nonPacked string str;
-        uint num = uint.max;
-    }
+/*     static class SimpleC : SimpleB */
+/*     { */
+/*         @nonPacked string str; */
+/*         uint num = uint.max; */
+/*     } */
 
-    value = Value([Value(false), Value(99UL), Value(cast(ulong)(uint.max / 2u))]);
+/*     value = Value([Value(false), Value(99UL), Value(cast(ulong)(uint.max / 2u))]); */
 
-    SimpleC sc = value.as!(SimpleC);
-    assert(sc.flag == false);
-    assert(sc.type == 99);
-    assert(sc.num  == uint.max / 2);
-    assert(sc.str.empty);
+/*     SimpleC sc = value.as!(SimpleC); */
+/*     assert(sc.flag == false); */
+/*     assert(sc.type == 99); */
+/*     assert(sc.num  == uint.max / 2); */
+/*     assert(sc.str.empty); */
 
-    // std.typecons.Tuple
-    value = Value([Value(true), Value(1UL), Value(cast(ubyte[])"Hi!")]);
+/*     // std.typecons.Tuple */
+/*     value = Value([Value(true), Value(1UL), Value(cast(ubyte[])"Hi!")]); */
 
-    auto tuple = value.as!(Tuple!(bool, uint, string));
-    assert(tuple.field[0] == true);
-    assert(tuple.field[1] == 1u);
-    assert(tuple.field[2] == "Hi!");
+/*     auto tuple = value.as!(Tuple!(bool, uint, string)); */
+/*     assert(tuple.field[0] == true); */
+/*     assert(tuple.field[1] == 1u); */
+/*     assert(tuple.field[2] == "Hi!"); */
 
-    /*
-     * non-MessagePackable object is stopped by static assert
-     * static struct NonMessagePackable {}
-     * auto nonMessagePackable = value.as!(NonMessagePackable);
-     */
-}
+/*     /\* */
+/*      * non-MessagePackable object is stopped by static assert */
+/*      * static struct NonMessagePackable {} */
+/*      * auto nonMessagePackable = value.as!(NonMessagePackable); */
+/*      *\/ */
+/* } */
 
 
-/**
- * $(D Unpacked) is a $(D Range) wrapper for stream deserialization result
- */
+/* /\** */
+/*  * $(D Unpacked) is a $(D Range) wrapper for stream deserialization result */
+/*  *\/ */
 struct Unpacked
 {
     Value value;  /// deserialized value
@@ -4502,53 +4502,53 @@ void callbackBool(ref Value value, bool boolean)
 }
 
 
-unittest
-{
-    Value value;
+/* unittest */
+/* { */
+/*     Value value; */
 
-    // Unsigned integer
-    callbackUInt(value, uint.max);
-    assert(value.type         == Value.Type.unsigned);
-    assert(value.via.uinteger == uint.max);
+/*     // Unsigned integer */
+/*     callbackUInt(value, uint.max); */
+/*     assert(value.type         == Value.Type.unsigned); */
+/*     assert(value.via.uinteger == uint.max); */
 
-    // Signed integer
-    callbackInt(value, int.min);
-    assert(value.type        == Value.Type.signed);
-    assert(value.via.integer == int.min);
+/*     // Signed integer */
+/*     callbackInt(value, int.min); */
+/*     assert(value.type        == Value.Type.signed); */
+/*     assert(value.via.integer == int.min); */
 
-    // Floating point
-    callbackFloat(value, real.max);
-    assert(value.type         == Value.Type.floating);
-    assert(value.via.floating == real.max);
+/*     // Floating point */
+/*     callbackFloat(value, real.max); */
+/*     assert(value.type         == Value.Type.floating); */
+/*     assert(value.via.floating == real.max); */
 
-    // Raw
-    callbackRaw(value, cast(ubyte[])[1]);
-    assert(value.type    == Value.Type.raw);
-    assert(value.via.raw == cast(ubyte[])[1]);
+/*     // Raw */
+/*     callbackRaw(value, cast(ubyte[])[1]); */
+/*     assert(value.type    == Value.Type.raw); */
+/*     assert(value.via.raw == cast(ubyte[])[1]); */
 
-    // Array
-    Value[] array; array.reserve(16);
+/*     // Array */
+/*     Value[] array; array.reserve(16); */
 
-    callbackArray(value, 16);
-    assert(value.type               == Value.Type.array);
-    assert(value.via.array.capacity == array.capacity);
+/*     callbackArray(value, 16); */
+/*     assert(value.type               == Value.Type.array); */
+/*     assert(value.via.array.capacity == array.capacity); */
 
-    // Map
-    Value[Value] map;
+/*     // Map */
+/*     Value[Value] map; */
 
-    callbackMap(value, 16);
-    assert(value.type    == Value.Type.map);
-    assert(value.via.map == null);
+/*     callbackMap(value, 16); */
+/*     assert(value.type    == Value.Type.map); */
+/*     assert(value.via.map == null); */
 
-    // NIL
-    callbackNil(value);
-    assert(value.type == Value.Type.nil);
+/*     // NIL */
+/*     callbackNil(value); */
+/*     assert(value.type == Value.Type.nil); */
 
-    // Bool
-    callbackBool(value, true);
-    assert(value.type        == Value.Type.boolean);
-    assert(value.via.boolean == true);
-}
+/*     // Bool */
+/*     callbackBool(value, true); */
+/*     assert(value.type        == Value.Type.boolean); */
+/*     assert(value.via.boolean == true); */
+/* } */
 
 
 private:
