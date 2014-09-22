@@ -2381,11 +2381,11 @@ struct Unpacker
         {
             static if (__traits(compiles, { T t; t.fromMsgpack(this, withFieldName_); })) {
               object.fromMsgpack(this, withFieldName_);
-            } else static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { // backward compatible
+            } else /* static if (__traits(compiles, { T t; t.fromMsgpack(this); })) { // backward compatible */
                 object.fromMsgpack(this);
-            } else {
-                static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'");
-            }
+            /* } else { */
+            /*     static assert(0, "Failed to invoke 'fromMsgpack' on type '" ~ Unqual!T.stringof ~ "'"); */
+            /* } */
         } else {
             if (auto handler = object.classinfo in unpackHandlers) {
                 (*handler)(this, cast(void*)&object);
